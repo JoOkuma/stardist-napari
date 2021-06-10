@@ -63,10 +63,20 @@ def plugin_wrapper():
 
     DEBUG = False
 
-    def get_data(image):
+    def get_data(image, viewer):
         image = image.data[0] if image.multiscale else image.data
         # enforce dense numpy array in case we are given a dask array etc
+        if image.ndim == 4:
+            # if 3D + t data we only use the current time point
+            tp = viewer.dims.current_step[0]
+            image = image[tp]
         return np.asarray(image)
+
+    def get_shape(image):
+        image = image.data[0] if image.multiscale else image.data
+        if image.ndim == 4:
+            image = image[0]
+        return image.shape
 
     def change_handler(*widgets, init=True, debug=DEBUG):
         def decorator_change_handler(handler):
@@ -198,7 +208,7 @@ def plugin_wrapper():
             warn("multi-class mode not supported yet, ignoring classification output")
 
         lkwargs = {}
-        x = get_data(image)
+        x = get_data(image, viewer)
         axes = axes_check_and_normalize(axes, length=x.ndim)
         if norm_image:
             # TODO: address joint vs. channel-separate normalization properly (let user choose)
@@ -245,27 +255,32 @@ def plugin_wrapper():
         if cnn_output:
             (labels,polys), cnn_out = pred
             prob, dist = cnn_out[:2]
-            scale = tuple(model.config.grid)
-            dist = np.moveaxis(dist, -1,0)
+            scale = model.config.grid
+            scale = scale * np.array(image.scale)[-len(scale):]
+            scale = tuple(scale)
+            dist = np.moveaxis(dist, -1, 0)
             layers.append((dist, dict(name='StarDist distances',   scale=(1,)+scale, **lkwargs), 'image'))
             layers.append((prob, dict(name='StarDist probability', scale=     scale, **lkwargs), 'image'))
         else:
             labels,polys = pred
 
+        image_scale = image.scale[-labels.ndim:]
+
         if output_type in (Output.Labels.value,Output.Both.value):
-            layers.append((labels, dict(name='StarDist labels', **lkwargs), 'labels'))
+            layers.append((labels, dict(name='StarDist labels', scale=image_scale, **lkwargs), 'labels'))
         if output_type in (Output.Polys.value,Output.Both.value):
             n_objects = len(polys['points'])
             if isinstance(model, StarDist3D):
                 surface = surface_from_polys(polys)
                 layers.append((surface, dict(name='StarDist polyhedra',
                                              contrast_limits=(0,surface[-1].max()),
+                                             scale=image_scale,
                                              colormap=label_colormap(n_objects), **lkwargs), 'surface'))
             else:
                 # TODO: sometimes hangs for long time (indefinitely?) when returning many polygons (?)
                 # TODO: coordinates correct or need offset (0.5 or so)?
                 shapes = np.moveaxis(polys['coord'], 2,1)
-                layers.append((shapes, dict(name='StarDist polygons', shape_type='polygon',
+                layers.append((shapes, dict(name='StarDist polygons', shape_type='polygon', scale=image_scale,
                                             edge_width=0.75, edge_color='yellow', face_color=[0,0,0,0], **lkwargs), 'shapes'))
         return layers
 
@@ -345,10 +360,10 @@ def plugin_wrapper():
                     plugin.model_folder.line_edit.tooltip = 'Invalid model directory'
 
             def _image_axes(valid):
-                axes, image, err = getattr(self.args, 'image_axes', (None,None,None))
+                axes, image, err = getattr(self.args, 'image_axes', (None, None, None))
                 widgets_valid(plugin.axes, valid=(valid or (image is None and (axes is None or len(axes) == 0))))
                 if valid:
-                    plugin.axes.tooltip = '\n'.join([f'{a} = {s}' for a,s in zip(axes,get_data(image).shape)])
+                    plugin.axes.tooltip = '\n'.join([f'{a} = {s}' for a,s in zip(axes, get_shape(image))])
                     return axes, image
                 else:
                     if err is not None:
@@ -363,7 +378,7 @@ def plugin_wrapper():
                 n_tiles, image, err = getattr(self.args, 'n_tiles', (None,None,None))
                 widgets_valid(plugin.n_tiles, valid=(valid or image is None))
                 if valid:
-                    plugin.n_tiles.tooltip = 'no tiling' if n_tiles is None else '\n'.join([f'{t}: {s}' for t,s in zip(n_tiles,get_data(image).shape)])
+                    plugin.n_tiles.tooltip = 'no tiling' if n_tiles is None else '\n'.join([f'{t}: {s}' for t, s in zip(n_tiles, get_data(image, self.viewer).shape)])
                     return n_tiles
                 else:
                     msg = str(err) if err is not None else ''
@@ -394,7 +409,7 @@ def plugin_wrapper():
                 else:
                     # check if image and model are compatible
                     ch_model = config['n_channel_in']
-                    ch_image = get_data(image).shape[axes_dict(axes_image)['C']] if 'C' in axes_image else 1
+                    ch_image = get_shape(image).shape[axes_dict(axes_image)['C']] if 'C' in axes_image else 1
                     all_valid = set(axes_model.replace('C','')) == set(axes_image.replace('C','')) and ch_model == ch_image
 
                     widgets_valid(plugin.image, plugin.model2d, plugin.model3d, plugin.model_folder.line_edit, valid=all_valid)
@@ -515,12 +530,14 @@ def plugin_wrapper():
     @change_handler(plugin.image, init=False)
     def _image_change(event):
         image = event.value
-        ndim = get_data(image).ndim
-        plugin.image.tooltip = f"Shape: {get_data(image).shape}"
+        shape = get_shape(image)
+        plugin.image.tooltip = f"Shape: {shape}"
+        ndim = len(shape)
 
         # TODO: guess images axes better...
         axes = None
-        if ndim == 3:
+        if ndim == 3 or ndim == 4:
+            # if 3D + t only the current stack is evaluated
             axes = 'YXC' if image.rgb else 'ZYX'
         elif ndim == 2:
             axes = 'YX'
@@ -545,7 +562,7 @@ def plugin_wrapper():
         image = plugin.image.value
         try:
             image is not None or _raise(ValueError("no image selected"))
-            axes = axes_check_and_normalize(value, length=get_data(image).ndim, disallowed='S')
+            axes = axes_check_and_normalize(value, length=len(get_shape(image)), disallowed='S')
             update('image_axes', True, (axes, image, None))
         except ValueError as err:
             update('image_axes', False, (value, image, err))
@@ -561,7 +578,7 @@ def plugin_wrapper():
             if value is None:
                 update('n_tiles', True, (None, image, None))
                 return
-            shape = get_data(image).shape
+            shape = get_shape(image)
             try:
                 value = tuple(value)
                 len(value) == len(shape) or _raise(TypeError())
